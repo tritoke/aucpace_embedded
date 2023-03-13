@@ -1,0 +1,26 @@
+[package]
+name = "server"
+version = "0.1.0"
+authors = ["Sam <tritoke@protonmail.com>"]
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+panic-halt = "0.2.0"
+ufmt = "0.1.0"
+nb = "0.1.2"
+embedded-hal = "0.2.3"
+# postcard = "1.0.4"
+# rand_core = "0.6.4"
+rand_chacha = { version = "0.3.1", default-features = false }
+
+[dependencies.aucpace]
+git = "https://github.com/tritoke/PAKEs"
+rev = "45f22611f435e159910679abbafc9a54f8325a30"
+default-features = false
+features = []
+
+[dependencies.arduino-hal]
+git = "https://github.com/rahix/avr-hal"
+rev = "4c9c44c314eb061ee20556ef10d45dea36e75ee4"
+features = ["arduino-uno"]
