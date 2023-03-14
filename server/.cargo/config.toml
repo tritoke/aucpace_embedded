@@ -1,5 +1,7 @@
 [build]
-target = "avr-specs/avr-atmega328p.json"
+target = "thumbv7em-none-eabihf"
 
-[unstable]
-build-std = ["core"]
+[target.thumbv7em-none-eabihf]
+rustflags = [
+    "-C", "link-arg=-Tt4link.x",
+]

@@ -4,18 +4,3 @@ members = [
   "client",
   "server",
 ]
-
-# Configure the build for minimal size - AVRs have very little program memory
-[profile.avr-dev]
-inherits = "dev"
-panic = "abort"
-lto = true
-opt-level = "s"
-
-[profile.avr-release]
-inherits = "release"
-panic = "abort"
-codegen-units = 1
-debug = true
-lto = true
-opt-level = "s"
