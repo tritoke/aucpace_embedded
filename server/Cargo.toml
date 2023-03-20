@@ -25,6 +25,8 @@ rand_chacha = { version = "0.3.1", default-features = false }
 serde = { version = "1.0", default-features = false }
 postcard = { version = "1", default-features = false }
 sha2 = { version = "0.10", default-features = false }
+curve25519-dalek = { version = "4.0.0-rc.1", default-features = false }
+password-hash = { version = "0.5", default-features = false }
 
 [features]
 # Feature to use the Strong AuCPace protocol
