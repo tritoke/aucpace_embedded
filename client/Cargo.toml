@@ -6,3 +6,24 @@ edition = "2021"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
+serialport = "4.2"
+anyhow = "1.0"
+clap = { version = "4.1", features = ["derive"] }
+
+rand_core = { version = "0.6.4", features = ["getrandom"] }
+serde = "1.0"
+postcard = "1"
+
+[dependencies.aucpace]
+git = "https://github.com/RustCrypto/PAKEs"
+rev = "0c7e57a"
+features = [
+    "zeroize",
+    "getrandom",
+    "alloc",
+    "partial_augmentation",
+    "strong_aucpace",
+    "serde",
+]
+
+[features]
