@@ -3,10 +3,11 @@
 #![feature(type_alias_impl_trait)]
 
 mod database;
-use database::SingleUserDatabase;
 
 use aucpace::{AuCPaceServer, ClientMessage};
 use core::fmt::Write as _;
+use core::sync::atomic::{AtomicUsize, Ordering};
+use database::SingleUserDatabase;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_stm32::interrupt::USART2;
@@ -51,81 +52,71 @@ async fn main(_spawner: Spawner) -> ! {
     // unwrap!(usart.write(&buf[..count]).await);
 }
 
-struct MessageReceiver<'a> {
+// TODO: try just using a macro lmao, this shit sucks
+async fn receive_msg<'a, const K1: usize>(
     buf: &'a mut [u8; 1024],
-    idx: usize,
-}
+    usart: &mut Uart<'_, peripherals::USART2, DMA1_CH6, DMA1_CH5>,
+) -> ClientMessage<'a, K1> {
+    static IDX: AtomicUsize = AtomicUsize::new(0);
 
-impl<'a> MessageReceiver<'a> {
-    fn new(buf: &'a mut [u8; 1024]) -> Self {
-        Self { buf, idx: 0 }
-    }
+    let mut s: String<1024> = String::new();
+    loop {
+        // read as much as we can off the wire
+        let remaining = &mut buf[IDX.load(Ordering::Relaxed)..];
+        let count = unwrap!(usart.read_until_idle(remaining).await);
+        drop(remaining);
+        let zero_idx = if count == 0 {
+            continue;
+        } else {
+            // calculate the index of zero in the buffer
+            let zero_idx = buf[IDX.load(Ordering::Relaxed)..IDX.load(Ordering::Relaxed) + count]
+                .iter()
+                .position(|x| *x == 0)
+                .map(|pos| pos + IDX.load(Ordering::Relaxed));
 
-    async fn receive_msg<const K1: usize>(
-        &'a mut self,
-        usart: &mut Uart<'_, peripherals::USART2, DMA1_CH6, DMA1_CH5>,
-    ) -> ClientMessage<'a, K1> {
-        let mut s: String<1024> = String::new();
-        loop {
-            // read as much as we can off the wire
-            let remaining = &mut self.buf[self.idx..];
-            let count = unwrap!(usart.read_until_idle(remaining).await);
-            drop(remaining);
-            let zero_idx = if count == 0 {
-                continue;
-            } else {
-                // calculate the index of zero in the buffer
-                let zero_idx = self.buf[self.idx..self.idx + count]
-                    .iter()
-                    .position(|x| *x == 0)
-                    .map(|pos| pos + self.idx);
-
-                // log that we managed to read some data
-                info!(
-                    "Read {} bytes - {:02X} - {:?}",
-                    count,
-                    self.buf[self.idx..self.idx + count],
-                    zero_idx
-                );
-
-                // update state
-                self.idx += count;
-
+            // log that we managed to read some data
+            info!(
+                "Read {} bytes - {:02X} - {:?}",
+                count,
+                buf[IDX.load(Ordering::Relaxed)..IDX.load(Ordering::Relaxed) + count],
                 zero_idx
-            };
+            );
 
-            let Some(zi) = zero_idx else {
-                if self.idx == self.buf.len() {
-                    // we've reached the end of the buffer and haven't found a message
-                    // so reset the state by just clearing the buffer
-                    self.idx = 0;
-                    warn!("Weird state encountered - filled entire buffer without finding message.");
-                }
+            // update state
+            IDX.fetch_add(count, Ordering::Relaxed);
 
+            zero_idx
+        };
+
+        let Some(zi) = zero_idx else {
+            let swapped = IDX.compare_exchange(buf.len(), 0, Ordering::Relaxed, Ordering::Relaxed).is_ok();
+            if swapped {
+                warn!("Weird state encountered - filled entire buffer without finding message.");
+            }
+
+            continue;
+        };
+
+        let parsed = postcard::from_bytes_cobs::<ClientMessage<K1>>(&mut buf[..=zi]);
+        let msg = match parsed {
+            Ok(msg) => {
+                core::write!(s, "Parsed message - {msg:?}").ok();
+                info!("{}", s.as_str());
+                msg
+            }
+            Err(e) => {
+                core::write!(s, "Failed to parse message - {e:?}").ok();
+                error!("{}", s.as_str());
                 continue;
-            };
+            }
+        };
 
-            let parsed = postcard::from_bytes_cobs::<ClientMessage<K1>>(&mut self.buf[..=zi]);
-            let msg = match parsed {
-                Ok(msg) => {
-                    core::write!(s, "Parsed message - {msg:?}").ok();
-                    info!("{}", s.as_str());
-                    msg
-                }
-                Err(e) => {
-                    core::write!(s, "Failed to parse message - {e:?}").ok();
-                    error!("{}", s.as_str());
-                    continue;
-                }
-            };
+        // reset the state
+        // copy all the data we read after the 0 byte to the start of the buffer
+        buf.copy_within(zi + 1..IDX.load(Ordering::Relaxed), 0);
+        IDX.load(Ordering::Relaxed) = IDX.load(Ordering::Relaxed).saturating_sub(zi + 1);
 
-            // reset the state
-            // copy all the data we read after the 0 byte to the start of the buffer
-            self.buf.copy_within(zi + 1..self.idx, 0);
-            self.idx = self.idx.saturating_sub(zi + 1);
-
-            // now return the parsed
-            return msg;
-        }
+        // now return the parsed
+        return msg;
     }
 }
