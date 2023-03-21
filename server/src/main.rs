@@ -6,30 +6,54 @@ mod database;
 
 use aucpace::{AuCPaceServer, ClientMessage, Database};
 use core::fmt::Write as _;
-use core::sync::atomic::{AtomicUsize, Ordering};
-use curve25519_dalek::ristretto::CompressedRistretto;
-use curve25519_dalek::RistrettoPoint;
 use database::SingleUserDatabase;
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_stm32::interrupt::USART2;
 use embassy_stm32::usart::{Config, Uart, UartRx};
-use embassy_stm32::{interrupt, peripherals, usart};
+use embassy_stm32::{interrupt, peripherals};
 use embassy_time::Instant;
 use heapless::String;
-use rand_chacha::{ChaCha8Rng, ChaChaRng};
-use rand_core::{RngCore, SeedableRng};
-use sha2::digest::typenum::Compare;
+use rand_chacha::ChaCha8Rng;
+use rand_core::SeedableRng;
 use {defmt_rtt as _, panic_probe as _};
 
 const K1: usize = 16;
 const RECV_BUF_LEN: usize = 1024;
 
+/// Writing to a heapless::String then sending and clearing is annoying
+macro_rules! fmt_log {
+    (ERROR, $s:ident, $($arg:tt)*) => {
+        core::write!($s, $($arg)*).ok();
+        defmt::error!("{}", $s.as_str());
+        $s.clear();
+    };
+    (WARN, $s:ident, $($arg:tt)*) => {
+        core::write!($s, $($arg)*).ok();
+        defmt::warn!("{}", $s.as_str());
+        $s.clear();
+    };
+    (INFO, $s:ident, $($arg:tt)*) => {
+        core::write!($s, $($arg)*).ok();
+        defmt::info!("{}", $s.as_str());
+        $s.clear();
+    };
+    (DEBUG, $s:ident, $($arg:tt)*) => {
+        core::write!($s, $($arg)*).ok();
+        defmt::debug!("{}", $s.as_str());
+        $s.clear();
+    };
+    (TRACE, $s:ident, $($arg:tt)*) => {
+        core::write!($s, $($arg)*).ok();
+        defmt::trace!("{}", $s.as_str());
+        $s.clear();
+    };
+}
+
 /// function like macro to wrap sending data over USART2, returns the number of bytes sent
 macro_rules! send {
-    ($recvr:ident, $buf:ident, $msg:ident) => {{
-        let serialised = unwrap!(postcard::to_slice_cobs(&$msg, &mut $buf));
-        $recvr.write(&serialised).await;
+    ($tx:ident, $buf:ident, $msg:ident) => {{
+        let serialised = postcard::to_slice_cobs(&$msg, &mut $buf).unwrap();
+        unwrap!($tx.write(&serialised).await);
         serialised.len()
     }};
 }
@@ -41,15 +65,11 @@ macro_rules! recv {
             let parsed: postcard::Result<ClientMessage<K1>> = $recvr.recv_msg(&mut $buf).await;
             match parsed {
                 Ok(msg) => {
-                    core::write!($s, "Parsed message - {msg:?}").ok();
-                    debug!("{}", $s.as_str());
-                    $s.clear();
+                    fmt_log!(DEBUG, $s, "Parsed message - {msg:?}");
                     break msg;
                 }
                 Err(e) => {
-                    core::write!($s, "Failed to parse message - {e:?}").ok();
-                    error!("{}", $s.as_str());
-                    $s.clear();
+                    fmt_log!(ERROR, $s, "Failed to parse message - {e:?}");
                 }
             };
         }
@@ -99,33 +119,52 @@ async fn main(_spawner: Spawner) -> ! {
                 error!("Attempted to register with a username thats too long.");
             } else {
                 database.store_verifier(username, salt, None, verifier, params);
-                core::write!(s, "Registered {:?}", core::str::from_utf8(username));
-                error!("{}", s);
-                s.clear();
+                fmt_log!(ERROR, s, "Registered {:?}", core::str::from_utf8(username));
                 break;
             }
         }
     }
 
-    // now do a key-exchange
-    info!("Beginning AuCPace protocol");
-    let (server, message) = base_server.begin();
-    let mut bytes_sent = send!(rx, message);
-    info!("Sent Nonce");
+    loop {
+        // now do a key-exchange
+        info!("Beginning AuCPace protocol");
+        let (server, message) = base_server.begin();
+        let mut bytes_sent = send!(tx, buf, message);
+        info!("Sent Nonce");
 
-    // wait for the client nonce
-    let mut client_message: ClientMessage<K1> = recv!(stream, buf);
-    let server = if let ClientMessage::Nonce(client_nonce) = client_message {
-        server.agree_ssid(client_nonce)
-    } else {
-        panic!("Received invalid client message {:?}", client_message);
-    };
-    info!("Received Client Nonce");
+        // ===== SSID Establishment =====
+        let mut client_message: ClientMessage<K1> = recv!(receiver, buf, s);
+        let server = if let ClientMessage::Nonce(client_nonce) = client_message {
+            server.agree_ssid(client_nonce)
+        } else {
+            fmt_log!(
+                ERROR,
+                s,
+                "Received invalid client message {:?} - restarting negotiation",
+                client_message
+            );
+            continue;
+        };
+        info!("Received Client Nonce");
 
-    loop {}
+        // ===== Augmentation Layer =====
+        client_message = recv!(receiver, buf, s);
+        let (server, message) = if let ClientMessage::Username(username) = client_message {
+            server.generate_client_info(username, &database, &mut rng)
+        } else {
+            fmt_log!(
+                ERROR,
+                s,
+                "Received invalid client message {:?} - restarting negotiation",
+                client_message
+            );
+            continue;
+        };
+        info!("Received Client Username");
 
-    // send the message back
-    // unwrap!(tx.write(&buf[..count]).await);
+        bytes_sent += send!(tx, buf, message);
+        info!("Sent AugmentationInfo");
+    }
 }
 
 struct MsgReceiver<'uart> {
@@ -153,8 +192,13 @@ impl<'uart> MsgReceiver<'uart> {
             let zero_idx = if count == 0 {
                 continue;
             } else {
+                // update state
+                self.idx += count;
+
                 // calculate the index of zero in the self.buffer
-                let zero_idx = self.buf[self.idx..self.idx + count]
+                // it is tempting to optimise this to just what is read but more than one packet can
+                // be read at once so the whole buffer needs to be searched to allow for this behaviour
+                let zero_idx = self.buf[..self.idx]
                     .iter()
                     .position(|x| *x == 0)
                     .map(|pos| pos + self.idx);
@@ -166,9 +210,6 @@ impl<'uart> MsgReceiver<'uart> {
                     self.buf[self.idx..self.idx + count],
                     zero_idx
                 );
-
-                // update state
-                self.idx += count;
 
                 zero_idx
             };

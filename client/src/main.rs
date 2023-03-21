@@ -59,32 +59,7 @@ fn main() -> Result<()> {
     let mut buf = [0u8; 1024];
     let (client, msg) = base_client.begin();
     let ser_msg = postcard::to_slice_cobs(&msg, &mut buf)?;
-    loop {
-        serial.write_all(ser_msg)?;
-        thread::sleep(Duration::from_millis(300));
-    }
-
-    // send and receive messages :)
-    let mut buf = [0u8; 1024];
-    loop {
-        match serial.read(&mut buf) {
-            Ok(count) => {
-                eprintln!(
-                    "Received - {:02X?} :: {:?}",
-                    &buf[..count],
-                    String::from_utf8_lossy(&buf[..count])
-                );
-            }
-            Err(e) => {
-                if e.kind() != ErrorKind::TimedOut {
-                    eprintln!("Encountered unrecognised error - e={e:?}");
-                }
-            }
-        };
-
-        serial.write(b"Beans")?;
-        eprintln!("Sent - \"Beans\"");
-    }
+    serial.write_all(ser_msg)?;
 
     Ok(())
 }
