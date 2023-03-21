@@ -3,6 +3,7 @@ use aucpace::Client;
 use clap::Parser;
 use serialport::SerialPortType;
 use std::io::{ErrorKind, Read, Write};
+use std::thread;
 use std::time::Duration;
 
 const USART_BAUD: u32 = 115200;
@@ -58,7 +59,10 @@ fn main() -> Result<()> {
     let mut buf = [0u8; 1024];
     let (client, msg) = base_client.begin();
     let ser_msg = postcard::to_slice_cobs(&msg, &mut buf)?;
-    serial.write_all(ser_msg)?;
+    loop {
+        serial.write_all(ser_msg)?;
+        thread::sleep(Duration::from_millis(300));
+    }
 
     // send and receive messages :)
     let mut buf = [0u8; 1024];
