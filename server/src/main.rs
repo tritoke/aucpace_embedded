@@ -62,7 +62,7 @@ macro_rules! send {
 macro_rules! recv {
     ($recvr:ident, $buf:ident, $s:ident) => {
         loop {
-            let parsed: postcard::Result<ClientMessage<K1>> = $recvr.recv_msg(&mut $buf).await;
+            let parsed = $recvr.recv_msg(&mut $buf).await;
             match parsed {
                 Ok(msg) => {
                     fmt_log!(DEBUG, $s, "Parsed message - {msg:?}");
@@ -90,11 +90,11 @@ async fn main(_spawner: Spawner) -> ! {
 
     // configure the RNG, kind of insecure but this is just a demo and I don't have real entropy
     let now = Instant::now().as_micros();
-    let mut rng = ChaCha8Rng::seed_from_u64(now);
+    let server_rng = ChaCha8Rng::seed_from_u64(now);
     info!("Seeded RNG - seed = {}", now);
 
     // create our AuCPace server
-    let mut base_server: AuCPaceServer<sha2::Sha512, _, K1> = AuCPaceServer::new(rng);
+    let mut base_server: AuCPaceServer<sha2::Sha512, _, K1> = AuCPaceServer::new(server_rng);
     let mut database: SingleUserDatabase<100> = SingleUserDatabase::default();
     info!("Created the AuCPace Server and the Single User Database");
 
@@ -126,6 +126,10 @@ async fn main(_spawner: Spawner) -> ! {
     }
 
     loop {
+        let now = Instant::now().as_micros();
+        let mut session_rng = ChaCha8Rng::seed_from_u64(now);
+        info!("Seeded Session RNG - seed = {}", now);
+
         // now do a key-exchange
         info!("Beginning AuCPace protocol");
         let (server, message) = base_server.begin();
@@ -150,7 +154,7 @@ async fn main(_spawner: Spawner) -> ! {
         // ===== Augmentation Layer =====
         client_message = recv!(receiver, buf, s);
         let (server, message) = if let ClientMessage::Username(username) = client_message {
-            server.generate_client_info(username, &database, &mut rng)
+            server.generate_client_info(username, &database, &mut session_rng)
         } else {
             fmt_log!(
                 ERROR,
@@ -164,6 +168,8 @@ async fn main(_spawner: Spawner) -> ! {
 
         bytes_sent += send!(tx, buf, message);
         info!("Sent AugmentationInfo");
+
+        info!("Total bytes sent: {}", bytes_sent);
     }
 }
 
