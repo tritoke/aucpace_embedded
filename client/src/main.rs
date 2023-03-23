@@ -19,15 +19,15 @@ const K1: usize = 16;
 macro_rules! send {
     ($serial_mtx:ident, $msg:ident) => {{
         let serialised = postcard::to_stdvec_cobs(&$msg).expect("Failed to serialise message");
-        info!(
-            "Sending {} byte long message - {serialised:02X?}",
-            serialised.len()
-        );
-        $serial_mtx
-            .lock()
-            .expect("Failed to acquire serial port mutex")
-            .write_all(&serialised)
-            .expect("Failed to write message to serial");
+        for chunk in serialised.chunks(20) {
+            info!("Sending {} byte long message - {chunk:02X?}", chunk.len());
+            $serial_mtx
+                .lock()
+                .expect("Failed to acquire serial port mutex")
+                .write_all(&chunk)
+                .expect("Failed to write message to serial");
+            thread::sleep(Duration::from_millis(300));
+        }
         serialised.len()
     }};
 }
@@ -207,5 +207,38 @@ impl<'mtx> MsgReceiver<'mtx> {
             // parse the result
             break postcard::from_bytes_cobs::<ServerMessage<K1>>(&mut self.buf[..=zi]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use aucpace::ClientMessage;
+    use rand_core::OsRng;
+
+    #[test]
+    fn test_ser_de_cobs() {
+        let mut base_client = Client::new(OsRng);
+        let user = "username";
+        let pass = "password";
+        let message = base_client
+            .register_alloc(user.as_bytes(), pass, Params::recommended(), Scrypt)
+            .unwrap();
+
+        let mut ser = postcard::to_stdvec_cobs(&message).unwrap();
+        let de: ClientMessage<K1> = postcard::from_bytes_cobs(&mut ser).unwrap();
+
+        let ClientMessage::Registration { username: u1, salt: s1, params: p1, verifier: v1 } = message else {
+            panic!("Register didn't return a registration method?");
+        };
+
+        let ClientMessage::Registration { username: u2, salt: s2, params: p2, verifier: v2 } = de else {
+            panic!("Deserialized wrong kind of message...");
+        };
+
+        assert_eq!(u1, u2);
+        assert_eq!(s1, s2);
+        assert_eq!(p1, p2);
+        assert_eq!(v1, v2);
     }
 }

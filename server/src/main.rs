@@ -9,6 +9,7 @@ use core::fmt::Write as _;
 use database::SingleUserDatabase;
 use defmt::*;
 use embassy_executor::Spawner;
+use embassy_stm32::time::Hertz;
 use embassy_stm32::usart::{Config, Parity, Uart, UartRx};
 use embassy_stm32::{interrupt, peripherals};
 use embassy_time::Instant;
@@ -78,7 +79,11 @@ macro_rules! recv {
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) -> ! {
-    let p = embassy_stm32::init(Default::default());
+    let mut rcc_config: embassy_stm32::rcc::Config = Default::default();
+    rcc_config.sys_ck = Some(Hertz::mhz(32));
+    let mut board_config: embassy_stm32::Config = Default::default();
+    board_config.rcc = rcc_config;
+    let p = embassy_stm32::init(board_config);
     info!("Initialised peripherals.");
 
     // configure USART2 which goes over the USB port on this board
