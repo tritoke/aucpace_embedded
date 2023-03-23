@@ -1,7 +1,8 @@
 use anyhow::{anyhow, Result};
 use aucpace::{Client, ServerMessage};
 use clap::Parser;
-use serialport::{SerialPort, SerialPortType};
+use scrypt::{Params, Scrypt};
+use serialport::{DataBits, Parity, SerialPort, SerialPortType, StopBits};
 use std::io::{ErrorKind, Read, Write};
 use std::sync::Mutex;
 use std::time::Duration;
@@ -16,9 +17,12 @@ const K1: usize = 16;
 
 /// function like macro to wrap sending data over the serial port, returns the number of bytes sent
 macro_rules! send {
-    ($serial_mtx:ident, $buf:ident, $msg:ident) => {{
-        let serialised =
-            postcard::to_slice_cobs(&$msg, &mut $buf).expect("Failed to serialise message");
+    ($serial_mtx:ident, $msg:ident) => {{
+        let serialised = postcard::to_stdvec_cobs(&$msg).expect("Failed to serialise message");
+        info!(
+            "Sending {} byte long message - {serialised:02X?}",
+            serialised.len()
+        );
         $serial_mtx
             .lock()
             .expect("Failed to acquire serial port mutex")
@@ -30,16 +34,16 @@ macro_rules! send {
 
 /// function like macro to wrap receiving data over the serial port
 macro_rules! recv {
-    ($recvr:ident, $buf:ident, $s:ident) => {
+    ($recvr:ident) => {
         loop {
-            let parsed = $recvr.recv_msg(&mut $buf).await;
+            let parsed = $recvr.recv_msg();
             match parsed {
                 Ok(msg) => {
-                    fmt_log!(DEBUG, $s, "Parsed message - {msg:?}");
+                    debug!("Parsed message - {msg:?}");
                     break msg;
                 }
                 Err(e) => {
-                    fmt_log!(ERROR, $s, "Failed to parse message - {e:?}");
+                    error!("Failed to parse message - {e:?}");
                 }
             };
         }
@@ -50,7 +54,7 @@ macro_rules! recv {
 #[command(author, version, about, long_about = None)]
 struct Args {
     /// Name of the USB port to open
-    #[arg(short, long)]
+    #[arg(long)]
     port: Option<String>,
 
     /// List USB ports on the system
@@ -64,6 +68,14 @@ struct Args {
     /// Perform implicit mutual authentication instead of explicit mutual authentication
     #[arg(long)]
     implicit: bool,
+
+    /// The Username to perform the exchange with
+    #[arg(long, short)]
+    username: String,
+
+    /// The Password to perform the exchange with
+    #[arg(long, short)]
+    password: String,
 }
 
 fn main() -> Result<()> {
@@ -95,19 +107,30 @@ fn main() -> Result<()> {
         .port
         .ok_or_else(|| anyhow!("Must supply a USB port."))?;
     let mut serial = Mutex::new({
-        let mut sp = serialport::new(port_name, USART_BAUD).open()?;
-        sp.set_timeout(Duration::from_millis(100));
-        sp
+        serialport::new(port_name, USART_BAUD)
+            .timeout(Duration::from_millis(100))
+            .open()?
     });
-    let mut buf = [0u8; 1024];
-    let receiver = MsgReceiver::new(&serial);
+    let mut receiver = MsgReceiver::new(&serial);
+    info!("Opened serial port connection.");
 
     // start the client
     let mut base_client = Client::new(rand_core::OsRng);
-    let (client, message) = base_client.begin();
-    send!(serial, buf, message);
 
-    // Receive
+    let user = args.username.as_str();
+    let pass = args.password.as_str();
+    let message = base_client
+        .register_alloc(user.as_bytes(), pass, Params::recommended(), Scrypt)
+        .map_err(|e| anyhow!(e))?;
+    send!(serial, message);
+    info!("Registered as {user}:{pass}");
+
+    info!("Starting AuCPace");
+    let (client, message) = base_client.begin();
+    send!(serial, message);
+
+    // Receive the server's nonce
+    let server_message = recv!(receiver);
 
     Ok(())
 }
@@ -116,6 +139,7 @@ struct MsgReceiver<'mtx> {
     buf: [u8; RECV_BUF_LEN],
     idx: usize,
     mtx: &'mtx Mutex<Box<dyn SerialPort>>,
+    reset_pos: Option<usize>,
 }
 
 impl<'mtx> MsgReceiver<'mtx> {
@@ -124,18 +148,25 @@ impl<'mtx> MsgReceiver<'mtx> {
             buf: [0u8; 1024],
             idx: 0,
             mtx,
+            reset_pos: None,
         }
     }
 
-    fn recv_msg<'a>(
-        &mut self,
-        msg_buf: &'a mut [u8; RECV_BUF_LEN],
-    ) -> postcard::Result<ServerMessage<'a, K1>> {
+    fn recv_msg(&mut self) -> postcard::Result<ServerMessage<'_, K1>> {
+        // reset the state
+        // copy all the data we read after the 0 byte to the start of the self.buffer
+        if let Some(zi) = self.reset_pos {
+            self.buf.copy_within(zi + 1..self.idx, 0);
+            self.idx = self.idx.saturating_sub(zi + 1);
+            self.reset_pos = None;
+        }
+
         // acquire a handle to the serial port
         let mut serial = self
             .mtx
             .lock()
             .expect("Failed to acquire lock for serial port.");
+
         loop {
             // read as much as we can off the wire
             let count = serial
@@ -150,10 +181,7 @@ impl<'mtx> MsgReceiver<'mtx> {
                 // calculate the index of zero in the self.buffer
                 // it is tempting to optimise this to just what is read but more than one packet can
                 // be read at once so the whole buffer needs to be searched to allow for this behaviour
-                let zero_idx = self.buf[..self.idx]
-                    .iter()
-                    .position(|x| *x == 0)
-                    .map(|pos| pos + self.idx);
+                let zero_idx = self.buf[..self.idx].iter().position(|x| *x == 0);
 
                 // log that we managed to read some data
                 info!(
@@ -175,16 +203,9 @@ impl<'mtx> MsgReceiver<'mtx> {
                 continue;
             };
 
-            // copy out from our buffer into the receiving buffer
-            msg_buf[..=zi].copy_from_slice(&self.buf[..=zi]);
-
-            // reset the state
-            // copy all the data we read after the 0 byte to the start of the self.buffer
-            self.buf.copy_within(zi + 1..self.idx, 0);
-            self.idx = self.idx.saturating_sub(zi + 1);
-
+            self.reset_pos = Some(zi);
             // parse the result
-            break postcard::from_bytes_cobs::<ServerMessage<K1>>(msg_buf);
+            break postcard::from_bytes_cobs::<ServerMessage<K1>>(&mut self.buf[..=zi]);
         }
     }
 }

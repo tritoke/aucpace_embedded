@@ -9,7 +9,7 @@ use core::fmt::Write as _;
 use database::SingleUserDatabase;
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_stm32::usart::{Config, Uart, UartRx};
+use embassy_stm32::usart::{Config, Parity, Uart, UartRx};
 use embassy_stm32::{interrupt, peripherals};
 use embassy_time::Instant;
 use heapless::String;
@@ -60,9 +60,9 @@ macro_rules! send {
 
 /// function like macro to wrap receiving data over USART2
 macro_rules! recv {
-    ($recvr:ident, $buf:ident, $s:ident) => {
+    ($recvr:ident, $s:ident) => {
         loop {
-            let parsed = $recvr.recv_msg(&mut $buf).await;
+            let parsed = $recvr.recv_msg().await;
             match parsed {
                 Ok(msg) => {
                     fmt_log!(DEBUG, $s, "Parsed message - {msg:?}");
@@ -107,7 +107,7 @@ async fn main(_spawner: Spawner) -> ! {
     // wait for a user to register themselves
     info!("Waiting for a registration packet.");
     loop {
-        let msg = recv!(receiver, buf, s);
+        let msg = recv!(receiver, s);
         if let ClientMessage::Registration {
             username,
             salt,
@@ -137,7 +137,7 @@ async fn main(_spawner: Spawner) -> ! {
         info!("Sent Nonce");
 
         // ===== SSID Establishment =====
-        let mut client_message: ClientMessage<K1> = recv!(receiver, buf, s);
+        let mut client_message: ClientMessage<K1> = recv!(receiver, s);
         let server = if let ClientMessage::Nonce(client_nonce) = client_message {
             server.agree_ssid(client_nonce)
         } else {
@@ -152,7 +152,7 @@ async fn main(_spawner: Spawner) -> ! {
         info!("Received Client Nonce");
 
         // ===== Augmentation Layer =====
-        client_message = recv!(receiver, buf, s);
+        client_message = recv!(receiver, s);
         let (server, message) = if let ClientMessage::Username(username) = client_message {
             server.generate_client_info(username, &database, &mut session_rng)
         } else {
@@ -177,6 +177,7 @@ struct MsgReceiver<'uart> {
     buf: [u8; RECV_BUF_LEN],
     idx: usize,
     rx: UartRx<'uart, peripherals::USART2, peripherals::DMA1_CH5>,
+    reset_pos: Option<usize>,
 }
 
 impl<'uart> MsgReceiver<'uart> {
@@ -185,37 +186,42 @@ impl<'uart> MsgReceiver<'uart> {
             buf: [0u8; 1024],
             idx: 0,
             rx,
+            reset_pos: None,
         }
     }
 
-    async fn recv_msg<'a>(
-        &mut self,
-        msg_buf: &'a mut [u8; RECV_BUF_LEN],
-    ) -> postcard::Result<ClientMessage<'a, K1>> {
+    /// Performs a reset if one is required
+    fn reset(&mut self) {}
+
+    async fn recv_msg(&mut self) -> postcard::Result<ClientMessage<'_, K1>> {
+        // reset the state
+        // copy all the data we read after the 0 byte to the start of the self.buffer
+        if let Some(zi) = self.reset_pos {
+            self.buf.copy_within(zi + 1..self.idx, 0);
+            self.idx = self.idx.saturating_sub(zi + 1);
+            self.reset_pos = None;
+        }
+
         loop {
             // read as much as we can off the wire
             let count = unwrap!(self.rx.read_until_idle(&mut self.buf[self.idx..]).await);
             let zero_idx = if count == 0 {
                 continue;
             } else {
+                // log that we managed to read some data
+                info!(
+                    "Read {} bytes - {:02X}",
+                    count,
+                    self.buf[self.idx..self.idx + count],
+                );
+
                 // update state
                 self.idx += count;
 
                 // calculate the index of zero in the self.buffer
                 // it is tempting to optimise this to just what is read but more than one packet can
                 // be read at once so the whole buffer needs to be searched to allow for this behaviour
-                let zero_idx = self.buf[..self.idx]
-                    .iter()
-                    .position(|x| *x == 0)
-                    .map(|pos| pos + self.idx);
-
-                // log that we managed to read some data
-                info!(
-                    "Read {} bytes - {:02X} - {:?}",
-                    count,
-                    self.buf[self.idx..self.idx + count],
-                    zero_idx
-                );
+                let zero_idx = self.buf[..self.idx].iter().position(|x| *x == 0);
 
                 zero_idx
             };
@@ -228,17 +234,17 @@ impl<'uart> MsgReceiver<'uart> {
 
                 continue;
             };
+            debug!("self.buf[..self.idx] = {:02X}", self.buf[..self.idx]);
+            info!(
+                "Found zero byte at index {} - {} - {}",
+                zi, self.buf[zi], self.idx
+            );
 
-            // copy out from our buffer into the receiving buffer
-            msg_buf[..=zi].copy_from_slice(&self.buf[..=zi]);
-
-            // reset the state
-            // copy all the data we read after the 0 byte to the start of the self.buffer
-            self.buf.copy_within(zi + 1..self.idx, 0);
-            self.idx = self.idx.saturating_sub(zi + 1);
+            // store zi for next time
+            self.reset_pos = Some(zi);
 
             // parse the result
-            break postcard::from_bytes_cobs::<ClientMessage<K1>>(msg_buf);
+            break postcard::from_bytes_cobs::<ClientMessage<K1>>(&mut self.buf[..=zi]);
         }
     }
 }
