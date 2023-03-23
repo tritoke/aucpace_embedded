@@ -10,7 +10,7 @@ use database::SingleUserDatabase;
 use defmt::*;
 use embassy_executor::Spawner;
 use embassy_stm32::time::Hertz;
-use embassy_stm32::usart::{Config, Parity, Uart, UartRx};
+use embassy_stm32::usart::{Config, Uart, UartRx};
 use embassy_stm32::{interrupt, peripherals};
 use embassy_time::Instant;
 use heapless::String;
@@ -89,7 +89,7 @@ async fn main(_spawner: Spawner) -> ! {
     // configure USART2 which goes over the USB port on this board
     let config = Config::default();
     let irq = interrupt::take!(USART2);
-    let (mut tx, mut rx) =
+    let (mut tx, rx) =
         Uart::new(p.USART2, p.PA3, p.PA2, irq, p.DMA1_CH6, p.DMA1_CH5, config).split();
     info!("Configured USART2.");
 
@@ -113,6 +113,7 @@ async fn main(_spawner: Spawner) -> ! {
     info!("Waiting for a registration packet.");
     loop {
         let msg = recv!(receiver, s);
+        #[cfg(not(feature = "strong"))]
         if let ClientMessage::Registration {
             username,
             salt,
@@ -124,22 +125,28 @@ async fn main(_spawner: Spawner) -> ! {
                 error!("Attempted to register with a username thats too long.");
             } else {
                 database.store_verifier(username, salt, None, verifier, params);
-                fmt_log!(ERROR, s, "Registered {:?}", core::str::from_utf8(username));
+                info!("Registered {:a}", username);
                 break;
             }
         }
+        #[cfg(feature = "strong")]
+        if let ClientMessage::StrongRegistration {
+            username,
+            secret_exponent,
+            params,
+            verifier,
+        } = msg
+        {}
     }
 
     loop {
-        let now = Instant::now().as_micros();
-        let mut session_rng = ChaCha8Rng::seed_from_u64(now);
-        info!("Seeded Session RNG - seed = {}", now);
+        let start = Instant::now();
+        let mut session_rng = ChaCha8Rng::seed_from_u64(start.as_micros());
+        info!("Seeded Session RNG - seed = {}", start.as_micros());
 
         // now do a key-exchange
         info!("Beginning AuCPace protocol");
         let (server, message) = base_server.begin();
-        let mut bytes_sent = send!(tx, buf, message);
-        info!("Sent Nonce");
 
         // ===== SSID Establishment =====
         let mut client_message: ClientMessage<K1> = recv!(receiver, s);
@@ -156,8 +163,13 @@ async fn main(_spawner: Spawner) -> ! {
         };
         info!("Received Client Nonce");
 
+        // now that we have received the client nonce, send our nonce back
+        let mut bytes_sent = send!(tx, buf, message);
+        info!("Sent Nonce");
+
         // ===== Augmentation Layer =====
         client_message = recv!(receiver, s);
+        #[cfg(not(feature = "strong"))]
         let (server, message) = if let ClientMessage::Username(username) = client_message {
             server.generate_client_info(username, &database, &mut session_rng)
         } else {
@@ -169,12 +181,77 @@ async fn main(_spawner: Spawner) -> ! {
             );
             continue;
         };
+        #[cfg(feature = "strong")]
+        let (server, message) =
+            if let ClientMessage::StrongUsername { username, blinded } = client_message {
+                server.generate_client_info_strong(username, blinded, &database, &mut session_rng)
+            } else {
+                fmt_log!(
+                    ERROR,
+                    s,
+                    "Received invalid client message {:?} - restarting negotiation",
+                    client_message
+                );
+                continue;
+            };
+
         info!("Received Client Username");
 
         bytes_sent += send!(tx, buf, message);
         info!("Sent AugmentationInfo");
 
+        // ===== CPace substep =====
+        let ci = "Server-USART2-Client-SerialPort";
+        let (server, message) = server.generate_public_key(ci);
+        bytes_sent += send!(tx, buf, message);
+        info!("Sent PublicKey");
+
+        client_message = recv!(receiver, s);
+        let server = if let ClientMessage::PublicKey(client_pubkey) = client_message {
+            server.receive_client_pubkey(client_pubkey)
+        } else {
+            fmt_log!(
+                ERROR,
+                s,
+                "Received invalid client message {:?}",
+                client_message
+            );
+            continue;
+        };
+        info!("Received Client PublicKey");
+
+        // ===== Explicit Mutual Authentication =====
+        client_message = recv!(receiver, s);
+        let (key, message) = if let ClientMessage::Authenticator(ca) = client_message {
+            match server.receive_client_authenticator(ca) {
+                Ok(inner) => inner,
+                Err(e) => {
+                    fmt_log!(
+                        ERROR,
+                        s,
+                        "Client failed the Explicit Mutual Authentication check - {e:?}"
+                    );
+                    continue;
+                }
+            }
+        } else {
+            fmt_log!(
+                ERROR,
+                s,
+                "Received invalid client message {:?}",
+                client_message
+            );
+            continue;
+        };
+        bytes_sent += send!(tx, buf, message);
+        info!("Sent Authenticator");
+        info!("Derived final key: {:02X}", key.as_slice());
+
         info!("Total bytes sent: {}", bytes_sent);
+        info!(
+            "Derived final key in {}ms",
+            Instant::now().duration_since(start).as_millis()
+        );
     }
 }
 
@@ -195,9 +272,6 @@ impl<'uart> MsgReceiver<'uart> {
         }
     }
 
-    /// Performs a reset if one is required
-    fn reset(&mut self) {}
-
     async fn recv_msg(&mut self) -> postcard::Result<ClientMessage<'_, K1>> {
         // reset the state
         // copy all the data we read after the 0 byte to the start of the self.buffer
@@ -214,7 +288,7 @@ impl<'uart> MsgReceiver<'uart> {
                 continue;
             } else {
                 // log that we managed to read some data
-                info!(
+                trace!(
                     "Read {} bytes - {:02X}",
                     count,
                     self.buf[self.idx..self.idx + count],
@@ -239,10 +313,12 @@ impl<'uart> MsgReceiver<'uart> {
 
                 continue;
             };
-            debug!("self.buf[..self.idx] = {:02X}", self.buf[..self.idx]);
-            info!(
+            trace!("self.buf[..self.idx] = {:02X}", self.buf[..self.idx]);
+            trace!(
                 "Found zero byte at index {} - {} - {}",
-                zi, self.buf[zi], self.idx
+                zi,
+                self.buf[zi],
+                self.idx
             );
 
             // store zi for next time

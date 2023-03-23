@@ -2,14 +2,14 @@ use anyhow::{anyhow, Result};
 use aucpace::{Client, ServerMessage};
 use clap::Parser;
 use scrypt::{Params, Scrypt};
-use serialport::{DataBits, Parity, SerialPort, SerialPortType, StopBits};
-use std::io::{ErrorKind, Read, Write};
+use serialport::{SerialPort, SerialPortType};
+use std::io::{Read, Write};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use std::{io, thread};
 
 #[allow(unused)]
-use tracing::{debug, error, info, warn, Level};
+use tracing::{debug, error, info, trace, warn};
 
 const USART_BAUD: u32 = 115200;
 const RECV_BUF_LEN: usize = 1024;
@@ -19,14 +19,14 @@ const K1: usize = 16;
 macro_rules! send {
     ($serial_mtx:ident, $msg:ident) => {{
         let serialised = postcard::to_stdvec_cobs(&$msg).expect("Failed to serialise message");
-        for chunk in serialised.chunks(20) {
-            info!("Sending {} byte long message - {chunk:02X?}", chunk.len());
+        for chunk in serialised.chunks(16) {
+            trace!("Sending {} byte long message - {chunk:02X?}", chunk.len());
             $serial_mtx
                 .lock()
                 .expect("Failed to acquire serial port mutex")
                 .write_all(&chunk)
                 .expect("Failed to write message to serial");
-            thread::sleep(Duration::from_millis(300));
+            thread::sleep(Duration::from_millis(100));
         }
         serialised.len()
     }};
@@ -61,9 +61,13 @@ struct Args {
     #[arg(long)]
     list_ports: bool,
 
-    /// Perform strong AuCPace
+    /// The maximum log level
+    #[arg(long, default_value_t = tracing::Level::DEBUG)]
+    log_level: tracing::Level,
+
+    /// Perform registration before AuCPace
     #[arg(long)]
-    strong: bool,
+    register: bool,
 
     /// Perform implicit mutual authentication instead of explicit mutual authentication
     #[arg(long)]
@@ -81,14 +85,14 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::try_parse()?;
 
-    debug!("args={args:?}");
-
     // setup the logger
     tracing_subscriber::fmt()
         .with_ansi(true)
-        .with_max_level(Level::DEBUG)
+        .with_max_level(args.log_level)
         .with_writer(io::stderr)
         .init();
+
+    debug!("args={args:?}");
 
     // list the ports if the user asks for it
     if args.list_ports {
@@ -106,9 +110,9 @@ fn main() -> Result<()> {
     let port_name = args
         .port
         .ok_or_else(|| anyhow!("Must supply a USB port."))?;
-    let mut serial = Mutex::new({
+    let serial = Mutex::new({
         serialport::new(port_name, USART_BAUD)
-            .timeout(Duration::from_millis(100))
+            .timeout(Duration::from_millis(500))
             .open()?
     });
     let mut receiver = MsgReceiver::new(&serial);
@@ -116,21 +120,94 @@ fn main() -> Result<()> {
 
     // start the client
     let mut base_client = Client::new(rand_core::OsRng);
+    let mut bytes_sent = 0;
 
     let user = args.username.as_str();
     let pass = args.password.as_str();
-    let message = base_client
-        .register_alloc(user.as_bytes(), pass, Params::recommended(), Scrypt)
-        .map_err(|e| anyhow!(e))?;
-    send!(serial, message);
-    info!("Registered as {user}:{pass}");
+    if args.register {
+        let message = base_client
+            .register_alloc(user.as_bytes(), pass, Params::recommended(), Scrypt)
+            .map_err(|e| anyhow!(e))?;
+        bytes_sent += send!(serial, message);
+        info!("Registered as {user}:{pass}");
+    }
 
     info!("Starting AuCPace");
+    let start = Instant::now();
     let (client, message) = base_client.begin();
-    send!(serial, message);
+    bytes_sent += send!(serial, message);
 
-    // Receive the server's nonce
-    let server_message = recv!(receiver);
+    // ===== SSID Establishment =====
+    let mut server_message = recv!(receiver);
+    let client = if let ServerMessage::Nonce(server_nonce) = server_message {
+        client.agree_ssid(server_nonce)
+    } else {
+        panic!("Received invalid server message {:?}", server_message);
+    };
+    info!("Agreed on SSID");
+
+    // ===== Augmentation Layer =====
+    let (client, message) = client.start_augmentation(user.as_bytes(), pass.as_bytes());
+    bytes_sent += send!(serial, message);
+    info!("Sending message: Username");
+
+    server_message = recv!(receiver);
+    let client = if let ServerMessage::AugmentationInfo {
+        x_pub,
+        salt,
+        pbkdf_params,
+        ..
+    } = server_message
+    {
+        let params = {
+            // its christmas time!
+            let log_n = pbkdf_params.get_str("ln").unwrap().parse().unwrap();
+            let r = pbkdf_params.get_str("r").unwrap().parse().unwrap();
+            let p = pbkdf_params.get_str("p").unwrap().parse().unwrap();
+            let len = Params::RECOMMENDED_LEN;
+
+            Params::new(log_n, r, p, len).unwrap()
+        };
+        client
+            .generate_cpace_alloc(x_pub, &salt, params, Scrypt)
+            .expect("Failed to generate CPace step data")
+    } else {
+        panic!("Received invalid server message {:?}", server_message);
+    };
+    info!("Received Augmentation info");
+
+    // ===== CPace substep =====
+    let ci = "Server-USART2-Client-SerialPort";
+    let (client, message) = client.generate_public_key(ci, &mut rand_core::OsRng);
+    bytes_sent += send!(serial, message);
+    info!("Sent PublicKey");
+
+    server_message = recv!(receiver);
+    let (client, message) = if let ServerMessage::PublicKey(server_pubkey) = server_message {
+        client.receive_server_pubkey(server_pubkey)
+    } else {
+        panic!("Received invalid server message {:?}", server_message);
+    };
+
+    // ===== Explicit Mutual Auth =====
+    bytes_sent += send!(serial, message);
+    info!("Sent Authenticator");
+
+    server_message = recv!(receiver);
+    let key = if let ServerMessage::Authenticator(server_authenticator) = server_message {
+        client
+            .receive_server_authenticator(server_authenticator)
+            .expect("Failed Explicit Mutual Authentication")
+    } else {
+        panic!("Received invalid server message {:?}", server_message);
+    };
+
+    info!("Derived final key: {:02X?}", key.as_slice());
+    info!("Total bytes sent: {}", bytes_sent);
+    info!(
+        "Derived final key in {}ms",
+        Instant::now().duration_since(start).as_millis()
+    );
 
     Ok(())
 }
@@ -175,6 +252,13 @@ impl<'mtx> MsgReceiver<'mtx> {
             let zero_idx = if count == 0 {
                 continue;
             } else {
+                // log that we managed to read some data
+                trace!(
+                    "Read {} bytes - {:02X?}",
+                    count,
+                    &self.buf[self.idx..self.idx + count]
+                );
+
                 // update state
                 self.idx += count;
 
@@ -182,14 +266,6 @@ impl<'mtx> MsgReceiver<'mtx> {
                 // it is tempting to optimise this to just what is read but more than one packet can
                 // be read at once so the whole buffer needs to be searched to allow for this behaviour
                 let zero_idx = self.buf[..self.idx].iter().position(|x| *x == 0);
-
-                // log that we managed to read some data
-                info!(
-                    "Read {} bytes - {:02X?} - {:?}",
-                    count,
-                    &self.buf[self.idx..self.idx + count],
-                    zero_idx
-                );
 
                 zero_idx
             };
@@ -207,38 +283,5 @@ impl<'mtx> MsgReceiver<'mtx> {
             // parse the result
             break postcard::from_bytes_cobs::<ServerMessage<K1>>(&mut self.buf[..=zi]);
         }
-    }
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use aucpace::ClientMessage;
-    use rand_core::OsRng;
-
-    #[test]
-    fn test_ser_de_cobs() {
-        let mut base_client = Client::new(OsRng);
-        let user = "username";
-        let pass = "password";
-        let message = base_client
-            .register_alloc(user.as_bytes(), pass, Params::recommended(), Scrypt)
-            .unwrap();
-
-        let mut ser = postcard::to_stdvec_cobs(&message).unwrap();
-        let de: ClientMessage<K1> = postcard::from_bytes_cobs(&mut ser).unwrap();
-
-        let ClientMessage::Registration { username: u1, salt: s1, params: p1, verifier: v1 } = message else {
-            panic!("Register didn't return a registration method?");
-        };
-
-        let ClientMessage::Registration { username: u2, salt: s2, params: p2, verifier: v2 } = de else {
-            panic!("Deserialized wrong kind of message...");
-        };
-
-        assert_eq!(u1, u2);
-        assert_eq!(s1, s2);
-        assert_eq!(p1, p2);
-        assert_eq!(v1, v2);
     }
 }

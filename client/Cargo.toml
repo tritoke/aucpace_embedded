@@ -24,9 +24,9 @@ features = [
     "zeroize",
     "getrandom",
     "alloc",
-    "partial_augmentation",
-    "strong_aucpace",
     "serde",
 ]
 
 [features]
+# Feature to use the Strong AuCPace protocol
+strong = ["aucpace/strong_aucpace"]
