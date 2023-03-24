@@ -16,6 +16,12 @@ const USART_BAUD: u32 = 115200;
 const RECV_BUF_LEN: usize = 1024;
 const K1: usize = 16;
 
+#[cfg(feature = "static_ssid")]
+const SSID: [u8; 32] = [
+    60, 173, 56, 252, 74, 141, 171, 146, 102, 169, 149, 169, 158, 106, 87, 232, 220, 141, 251, 73,
+    39, 130, 105, 184, 93, 87, 195, 23, 246, 158, 85, 226,
+];
+
 /// function like macro to wrap sending data over the serial port, returns the number of bytes sent
 macro_rules! send {
     ($serial_mtx:ident, $msg:ident) => {{
@@ -145,17 +151,28 @@ fn main() -> Result<()> {
 
     info!("Starting AuCPace");
     let start = Instant::now();
-    let (client, message) = base_client.begin();
-    bytes_sent += send!(serial, message);
-
     // ===== SSID Establishment =====
-    let mut server_message = recv!(receiver);
-    let client = if let ServerMessage::Nonce(server_nonce) = server_message {
-        client.agree_ssid(server_nonce)
-    } else {
-        panic!("Received invalid server message {:?}", server_message);
+    #[cfg(feature = "static_ssid")]
+    let client = {
+        let client = base_client.begin_prestablished_ssid(SSID).unwrap();
+        info!("Began from static SSID={:02X?}", SSID);
+        client
     };
-    info!("Agreed on SSID");
+
+    #[cfg(not(feature = "static_ssid"))]
+    let client = {
+        let (client, message) = base_client.begin();
+        bytes_sent += send!(serial, message);
+
+        let server_message = recv!(receiver);
+        let client = if let ServerMessage::Nonce(server_nonce) = server_message {
+            client.agree_ssid(server_nonce)
+        } else {
+            panic!("Received invalid server message {:?}", server_message);
+        };
+        info!("Agreed on SSID");
+        client
+    };
 
     // ===== Augmentation Layer =====
     #[cfg(not(feature = "strong"))]
@@ -170,7 +187,7 @@ fn main() -> Result<()> {
     };
     bytes_sent += send!(serial, message);
 
-    server_message = recv!(receiver);
+    let mut server_message = recv!(receiver);
     #[cfg(not(feature = "strong"))]
     let client = if let ServerMessage::AugmentationInfo {
         x_pub,

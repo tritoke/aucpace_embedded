@@ -30,6 +30,12 @@ use aucpace::PartialAugDatabase;
 const K1: usize = 16;
 const RECV_BUF_LEN: usize = 1024;
 
+#[cfg(feature = "static_ssid")]
+const SSID: [u8; 32] = [
+    60, 173, 56, 252, 74, 141, 171, 146, 102, 169, 149, 169, 158, 106, 87, 232, 220, 141, 251, 73,
+    39, 130, 105, 184, 93, 87, 195, 23, 246, 158, 85, 226,
+];
+
 /// Writing to a heapless::String then sending and clearing is annoying
 macro_rules! fmt_log {
     (ERROR, $s:ident, $($arg:tt)*) => {
@@ -174,38 +180,54 @@ async fn main(_spawner: Spawner) -> ! {
 
         let start = Instant::now();
         let mut session_rng = ChaCha8Rng::seed_from_u64(start.as_micros());
+        let mut bytes_sent = 0;
         time_taken += Instant::now().duration_since(start);
         info!("Seeded Session RNG - seed = {}", start.as_micros());
 
         // now do a key-exchange
         info!("Beginning AuCPace protocol");
-        let t0 = Instant::now();
-        let (server, message) = base_server.begin();
-        time_taken += Instant::now().duration_since(t0);
 
         // ===== SSID Establishment =====
-        let mut client_message: ClientMessage<K1> = recv!(receiver, s);
-        let t0 = Instant::now();
-        let server = if let ClientMessage::Nonce(client_nonce) = client_message {
-            server.agree_ssid(client_nonce)
-        } else {
-            fmt_log!(
-                ERROR,
-                s,
-                "Received invalid client message {:?} - restarting negotiation",
-                client_message
-            );
-            continue;
+        #[cfg(feature = "static_ssid")]
+        let server = {
+            let t0 = Instant::now();
+            let server = base_server.begin_prestablished_ssid(SSID).unwrap();
+            time_taken += Instant::now().duration_since(t0);
+            info!("Began from static SSID={:02X}", SSID);
+            server
         };
-        time_taken += Instant::now().duration_since(t0);
-        info!("Received Client Nonce");
 
-        // now that we have received the client nonce, send our nonce back
-        let mut bytes_sent = send!(tx, buf, message);
-        info!("Sent Nonce");
+        #[cfg(not(feature = "static_ssid"))]
+        let server = {
+            let t0 = Instant::now();
+            let (server, message) = base_server.begin();
+            time_taken += Instant::now().duration_since(t0);
+
+            let client_message: ClientMessage<K1> = recv!(receiver, s);
+            let t0 = Instant::now();
+            let server = if let ClientMessage::Nonce(client_nonce) = client_message {
+                server.agree_ssid(client_nonce)
+            } else {
+                fmt_log!(
+                    ERROR,
+                    s,
+                    "Received invalid client message {:?} - restarting negotiation",
+                    client_message
+                );
+                continue;
+            };
+            time_taken += Instant::now().duration_since(t0);
+            info!("Received Client Nonce");
+
+            // now that we have received the client nonce, send our nonce back
+            bytes_sent = send!(tx, buf, message);
+            info!("Sent Nonce");
+
+            server
+        };
 
         // ===== Augmentation Layer =====
-        client_message = recv!(receiver, s);
+        let mut client_message = recv!(receiver, s);
         let t0 = Instant::now();
         #[cfg(not(feature = "strong"))]
         let (server, message) = if let ClientMessage::Username(username) = client_message {
