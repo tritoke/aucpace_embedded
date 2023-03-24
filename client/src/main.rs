@@ -125,8 +125,13 @@ fn main() -> Result<()> {
     let user = args.username.as_str();
     let pass = args.password.as_str();
     if args.register {
+        #[cfg(not(feature = "strong"))]
         let message = base_client
             .register_alloc(user.as_bytes(), pass, Params::recommended(), Scrypt)
+            .map_err(|e| anyhow!(e))?;
+        #[cfg(feature = "strong")]
+        let message = base_client
+            .register_alloc_strong(user.as_bytes(), pass, Params::recommended(), Scrypt)
             .map_err(|e| anyhow!(e))?;
         bytes_sent += send!(serial, message);
         info!("Registered as {user}:{pass}");
@@ -147,11 +152,13 @@ fn main() -> Result<()> {
     info!("Agreed on SSID");
 
     // ===== Augmentation Layer =====
-    let (client, message) = client.start_augmentation(user.as_bytes(), pass.as_bytes());
+    let (client, message) =
+        client.start_augmentation_strong(user.as_bytes(), pass.as_bytes(), &mut rand_core::OsRng);
     bytes_sent += send!(serial, message);
     info!("Sending message: Username");
 
     server_message = recv!(receiver);
+    #[cfg(not(feature = "strong"))]
     let client = if let ServerMessage::AugmentationInfo {
         x_pub,
         salt,
@@ -174,6 +181,31 @@ fn main() -> Result<()> {
     } else {
         panic!("Received invalid server message {:?}", server_message);
     };
+
+    #[cfg(feature = "strong")]
+    let client = if let ServerMessage::StrongAugmentationInfo {
+        x_pub,
+        blinded_salt,
+        pbkdf_params,
+        ..
+    } = server_message
+    {
+        let params = {
+            // its christmas time!
+            let log_n = pbkdf_params.get_str("ln").unwrap().parse().unwrap();
+            let r = pbkdf_params.get_str("r").unwrap().parse().unwrap();
+            let p = pbkdf_params.get_str("p").unwrap().parse().unwrap();
+            let len = Params::RECOMMENDED_LEN;
+
+            Params::new(log_n, r, p, len).unwrap()
+        };
+        client
+            .generate_cpace_alloc(x_pub, blinded_salt, params, Scrypt)
+            .expect("Failed to generate CPace step data")
+    } else {
+        panic!("Received invalid server message {:?}", server_message);
+    };
+
     info!("Received Augmentation info");
 
     // ===== CPace substep =====

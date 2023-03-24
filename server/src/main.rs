@@ -4,7 +4,7 @@
 
 mod database;
 
-use aucpace::{AuCPaceServer, ClientMessage, Database};
+use aucpace::{AuCPaceServer, ClientMessage};
 use core::fmt::Write as _;
 use database::SingleUserDatabase;
 use defmt::*;
@@ -17,6 +17,12 @@ use heapless::String;
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
 use {defmt_rtt as _, panic_probe as _};
+
+#[cfg(not(feature = "strong"))]
+use aucpace::Database;
+
+#[cfg(feature = "strong")]
+use aucpace::StrongDatabase;
 
 const K1: usize = 16;
 const RECV_BUF_LEN: usize = 1024;
@@ -129,6 +135,7 @@ async fn main(_spawner: Spawner) -> ! {
                 break;
             }
         }
+
         #[cfg(feature = "strong")]
         if let ClientMessage::StrongRegistration {
             username,
@@ -136,7 +143,15 @@ async fn main(_spawner: Spawner) -> ! {
             params,
             verifier,
         } = msg
-        {}
+        {
+            if username.len() > 100 {
+                error!("Attempted to register with a username thats too long.");
+            } else {
+                database.store_verifier_strong(username, None, verifier, secret_exponent, params);
+                info!("Registered {:a}", username);
+                break;
+            }
+        }
     }
 
     loop {
@@ -194,7 +209,6 @@ async fn main(_spawner: Spawner) -> ! {
                 );
                 continue;
             };
-
         info!("Received Client Username");
 
         bytes_sent += send!(tx, buf, message);

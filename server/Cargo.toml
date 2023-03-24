@@ -35,3 +35,5 @@ strong = ["aucpace/strong_aucpace"]
 partial = ["aucpace/partial_augmentation"]
 # Feature to use implicit authnetication
 implicit = []
+# Use the allocator
+alloc = []
