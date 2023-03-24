@@ -18,6 +18,12 @@ mod conditional_imports {
     pub type DbSalt = Scalar;
 }
 
+#[cfg(feature = "partial")]
+use aucpace::PartialAugDatabase;
+
+#[cfg(feature = "partial")]
+use curve25519_dalek::Scalar;
+
 use conditional_imports::*;
 use curve25519_dalek::RistrettoPoint;
 use password_hash::ParamsString;
@@ -27,6 +33,9 @@ use password_hash::ParamsString;
 pub struct SingleUserDatabase<const USERSIZE: usize> {
     user: Option<([u8; USERSIZE], usize)>,
     data: Option<(RistrettoPoint, DbSalt, ParamsString)>,
+
+    #[cfg(feature = "partial")]
+    long_term_keypair: Option<(Scalar, RistrettoPoint)>,
 }
 
 #[cfg(not(feature = "strong"))]
@@ -95,6 +104,39 @@ impl<const USERSIZE: usize> StrongDatabase for SingleUserDatabase<USERSIZE> {
             buf[..username.len()].copy_from_slice(username);
             self.user = Some((buf, username.len()));
             self.data = Some((verifier, secret_exponent, params));
+        }
+    }
+}
+
+#[cfg(feature = "partial")]
+impl<const USERSIZE: usize> PartialAugDatabase for SingleUserDatabase<USERSIZE> {
+    type PrivateKey = Scalar;
+    type PublicKey = RistrettoPoint;
+
+    fn lookup_long_term_keypair(
+        &self,
+        username: &[u8],
+    ) -> Option<(Self::PrivateKey, Self::PublicKey)> {
+        match self.user {
+            Some((ref stored_username, len)) if &stored_username[..len] == username => {
+                self.long_term_keypair.clone()
+            }
+            _ => None,
+        }
+    }
+
+    fn store_long_term_keypair(
+        &mut self,
+        username: &[u8],
+        priv_key: Self::PrivateKey,
+        pub_key: Self::PublicKey,
+    ) -> aucpace::Result<()> {
+        match self.user {
+            Some((ref stored_user, len)) if &stored_user[..len] == username => {
+                self.long_term_keypair = Some((priv_key, pub_key));
+                Ok(())
+            }
+            _ => Err(aucpace::Error::UserNotRegistered),
         }
     }
 }

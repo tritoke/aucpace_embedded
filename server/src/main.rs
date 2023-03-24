@@ -24,6 +24,9 @@ use aucpace::Database;
 #[cfg(feature = "strong")]
 use aucpace::StrongDatabase;
 
+#[cfg(feature = "partial")]
+use aucpace::PartialAugDatabase;
+
 const K1: usize = 16;
 const RECV_BUF_LEN: usize = 1024;
 
@@ -117,7 +120,8 @@ async fn main(_spawner: Spawner) -> ! {
 
     // wait for a user to register themselves
     info!("Waiting for a registration packet.");
-    loop {
+    #[cfg_attr(not(feature = "partial"), allow(unused))]
+    let user = loop {
         let msg = recv!(receiver, s);
         #[cfg(not(feature = "strong"))]
         if let ClientMessage::Registration {
@@ -132,7 +136,7 @@ async fn main(_spawner: Spawner) -> ! {
             } else {
                 database.store_verifier(username, salt, None, verifier, params);
                 info!("Registered {:a} for AuCPace", username);
-                break;
+                break username;
             }
         }
 
@@ -149,9 +153,20 @@ async fn main(_spawner: Spawner) -> ! {
             } else {
                 database.store_verifier_strong(username, None, verifier, secret_exponent, params);
                 info!("Registered {:a} for Strong AuCPace", username);
-                break;
+                break username;
             }
         }
+    };
+
+    #[cfg(feature = "partial")]
+    {
+        let (priv_key, pub_key) = base_server.generate_long_term_keypair();
+        // it is fine to unwrap here because we have already registered
+        // a verifier for the user with store_verifier
+        database
+            .store_long_term_keypair(user, priv_key, pub_key)
+            .unwrap();
+        info!("Stored a long term keypair for {:a}", user);
     }
 
     loop {
@@ -194,7 +209,12 @@ async fn main(_spawner: Spawner) -> ! {
         let t0 = Instant::now();
         #[cfg(not(feature = "strong"))]
         let (server, message) = if let ClientMessage::Username(username) = client_message {
-            server.generate_client_info(username, &database, &mut session_rng)
+            #[cfg(not(feature = "partial"))]
+            let ret = server.generate_client_info(username, &database, &mut session_rng);
+            #[cfg(feature = "partial")]
+            let ret =
+                server.generate_client_info_partial_aug(username, &database, &mut session_rng);
+            ret
         } else {
             fmt_log!(
                 ERROR,
@@ -206,18 +226,29 @@ async fn main(_spawner: Spawner) -> ! {
         };
 
         #[cfg(feature = "strong")]
-        let (server, message) =
-            if let ClientMessage::StrongUsername { username, blinded } = client_message {
-                server.generate_client_info_strong(username, blinded, &database, &mut session_rng)
-            } else {
-                fmt_log!(
-                    ERROR,
-                    s,
-                    "Received invalid client message {:?} - restarting negotiation",
-                    client_message
-                );
-                continue;
-            };
+        let (server, message) = if let ClientMessage::StrongUsername { username, blinded } =
+            client_message
+        {
+            #[cfg(not(feature = "partial"))]
+            let ret =
+                server.generate_client_info_strong(username, blinded, &database, &mut session_rng);
+            #[cfg(feature = "partial")]
+            let ret = server.generate_client_info_partial_strong(
+                username,
+                blinded,
+                &database,
+                &mut session_rng,
+            );
+            ret
+        } else {
+            fmt_log!(
+                ERROR,
+                s,
+                "Received invalid client message {:?} - restarting negotiation",
+                client_message
+            );
+            continue;
+        };
         time_taken += Instant::now().duration_since(t0);
 
         bytes_sent += send!(tx, buf, message);
