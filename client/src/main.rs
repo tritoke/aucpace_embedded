@@ -1,6 +1,7 @@
 use anyhow::{anyhow, Result};
 use aucpace::{Client, ServerMessage};
 use clap::Parser;
+use scrypt::password_hash::ParamsString;
 use scrypt::{Params, Scrypt};
 use serialport::{SerialPort, SerialPortType};
 use std::io::{Read, Write};
@@ -62,16 +63,12 @@ struct Args {
     list_ports: bool,
 
     /// The maximum log level
-    #[arg(long, default_value_t = tracing::Level::DEBUG)]
+    #[arg(long, default_value_t = tracing::Level::INFO)]
     log_level: tracing::Level,
 
-    /// Perform registration before AuCPace
+    /// Skip perform registration before AuCPace
     #[arg(long)]
-    register: bool,
-
-    /// Perform implicit mutual authentication instead of explicit mutual authentication
-    #[arg(long)]
-    implicit: bool,
+    skip_register: bool,
 
     /// The Username to perform the exchange with
     #[arg(long, short)]
@@ -124,17 +121,26 @@ fn main() -> Result<()> {
 
     let user = args.username.as_str();
     let pass = args.password.as_str();
-    if args.register {
+    if !args.skip_register {
         #[cfg(not(feature = "strong"))]
         let message = base_client
             .register_alloc(user.as_bytes(), pass, Params::recommended(), Scrypt)
             .map_err(|e| anyhow!(e))?;
+
         #[cfg(feature = "strong")]
         let message = base_client
             .register_alloc_strong(user.as_bytes(), pass, Params::recommended(), Scrypt)
             .map_err(|e| anyhow!(e))?;
+
         bytes_sent += send!(serial, message);
-        info!("Registered as {user}:{pass}");
+        info!(
+            "Registered as {user}:{pass} for {}",
+            if cfg!(feature = "strong") {
+                "Strong AuCPace"
+            } else {
+                "AuCPace"
+            }
+        );
     }
 
     info!("Starting AuCPace");
@@ -152,10 +158,17 @@ fn main() -> Result<()> {
     info!("Agreed on SSID");
 
     // ===== Augmentation Layer =====
-    let (client, message) =
-        client.start_augmentation_strong(user.as_bytes(), pass.as_bytes(), &mut rand_core::OsRng);
+    #[cfg(not(feature = "strong"))]
+    let (client, message) = {
+        info!("Sending message: Username");
+        client.start_augmentation(user.as_bytes(), pass.as_bytes())
+    };
+    #[cfg(feature = "strong")]
+    let (client, message) = {
+        info!("Sending message: Strong Username");
+        client.start_augmentation_strong(user.as_bytes(), pass.as_bytes(), &mut rand_core::OsRng)
+    };
     bytes_sent += send!(serial, message);
-    info!("Sending message: Username");
 
     server_message = recv!(receiver);
     #[cfg(not(feature = "strong"))]
@@ -166,15 +179,8 @@ fn main() -> Result<()> {
         ..
     } = server_message
     {
-        let params = {
-            // its christmas time!
-            let log_n = pbkdf_params.get_str("ln").unwrap().parse().unwrap();
-            let r = pbkdf_params.get_str("r").unwrap().parse().unwrap();
-            let p = pbkdf_params.get_str("p").unwrap().parse().unwrap();
-            let len = Params::RECOMMENDED_LEN;
-
-            Params::new(log_n, r, p, len).unwrap()
-        };
+        info!("Received Augmentation info");
+        let params = parse_params(pbkdf_params)?;
         client
             .generate_cpace_alloc(x_pub, &salt, params, Scrypt)
             .expect("Failed to generate CPace step data")
@@ -190,23 +196,14 @@ fn main() -> Result<()> {
         ..
     } = server_message
     {
-        let params = {
-            // its christmas time!
-            let log_n = pbkdf_params.get_str("ln").unwrap().parse().unwrap();
-            let r = pbkdf_params.get_str("r").unwrap().parse().unwrap();
-            let p = pbkdf_params.get_str("p").unwrap().parse().unwrap();
-            let len = Params::RECOMMENDED_LEN;
-
-            Params::new(log_n, r, p, len).unwrap()
-        };
+        info!("Received Strong Augmentation info");
+        let params = parse_params(pbkdf_params)?;
         client
             .generate_cpace_alloc(x_pub, blinded_salt, params, Scrypt)
             .expect("Failed to generate CPace step data")
     } else {
         panic!("Received invalid server message {:?}", server_message);
     };
-
-    info!("Received Augmentation info");
 
     // ===== CPace substep =====
     let ci = "Server-USART2-Client-SerialPort";
@@ -215,23 +212,26 @@ fn main() -> Result<()> {
     info!("Sent PublicKey");
 
     server_message = recv!(receiver);
-    let (client, message) = if let ServerMessage::PublicKey(server_pubkey) = server_message {
-        client.receive_server_pubkey(server_pubkey)
-    } else {
+    let ServerMessage::PublicKey(server_pubkey) = server_message else {
         panic!("Received invalid server message {:?}", server_message);
     };
-
-    // ===== Explicit Mutual Auth =====
-    bytes_sent += send!(serial, message);
-    info!("Sent Authenticator");
-
-    server_message = recv!(receiver);
-    let key = if let ServerMessage::Authenticator(server_authenticator) = server_message {
-        client
-            .receive_server_authenticator(server_authenticator)
-            .expect("Failed Explicit Mutual Authentication")
+    let key = if cfg!(feature = "implicit") {
+        client.implicit_auth(server_pubkey)
     } else {
-        panic!("Received invalid server message {:?}", server_message);
+        let (client, message) = client.receive_server_pubkey(server_pubkey);
+
+        // ===== Explicit Mutual Auth =====
+        bytes_sent += send!(serial, message);
+        info!("Sent Authenticator");
+
+        server_message = recv!(receiver);
+        if let ServerMessage::Authenticator(server_authenticator) = server_message {
+            client
+                .receive_server_authenticator(server_authenticator)
+                .expect("Failed Explicit Mutual Authentication")
+        } else {
+            panic!("Received invalid server message {:?}", server_message);
+        }
     };
 
     info!("Derived final key: {:02X?}", key.as_slice());
@@ -316,4 +316,14 @@ impl<'mtx> MsgReceiver<'mtx> {
             break postcard::from_bytes_cobs::<ServerMessage<K1>>(&mut self.buf[..=zi]);
         }
     }
+}
+
+fn parse_params(ps: ParamsString) -> Result<Params> {
+    const MSG: &str = "Missing parameter in ParamsString";
+    let ln = ps.get_str("ln").ok_or_else(|| anyhow!(MSG))?.parse()?;
+    let r = ps.get_str("r").ok_or_else(|| anyhow!(MSG))?.parse()?;
+    let p = ps.get_str("p").ok_or_else(|| anyhow!(MSG))?.parse()?;
+    let len = Params::RECOMMENDED_LEN;
+
+    Ok(Params::new(ln, r, p, len)?)
 }

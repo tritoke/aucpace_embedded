@@ -12,7 +12,7 @@ use embassy_executor::Spawner;
 use embassy_stm32::time::Hertz;
 use embassy_stm32::usart::{Config, Uart, UartRx};
 use embassy_stm32::{interrupt, peripherals};
-use embassy_time::Instant;
+use embassy_time::{Duration, Instant};
 use heapless::String;
 use rand_chacha::ChaCha8Rng;
 use rand_core::SeedableRng;
@@ -131,7 +131,7 @@ async fn main(_spawner: Spawner) -> ! {
                 error!("Attempted to register with a username thats too long.");
             } else {
                 database.store_verifier(username, salt, None, verifier, params);
-                info!("Registered {:a}", username);
+                info!("Registered {:a} for AuCPace", username);
                 break;
             }
         }
@@ -148,23 +148,29 @@ async fn main(_spawner: Spawner) -> ! {
                 error!("Attempted to register with a username thats too long.");
             } else {
                 database.store_verifier_strong(username, None, verifier, secret_exponent, params);
-                info!("Registered {:a}", username);
+                info!("Registered {:a} for Strong AuCPace", username);
                 break;
             }
         }
     }
 
     loop {
+        let mut time_taken = Duration::default();
+
         let start = Instant::now();
         let mut session_rng = ChaCha8Rng::seed_from_u64(start.as_micros());
+        time_taken += Instant::now().duration_since(start);
         info!("Seeded Session RNG - seed = {}", start.as_micros());
 
         // now do a key-exchange
         info!("Beginning AuCPace protocol");
+        let t0 = Instant::now();
         let (server, message) = base_server.begin();
+        time_taken += Instant::now().duration_since(t0);
 
         // ===== SSID Establishment =====
         let mut client_message: ClientMessage<K1> = recv!(receiver, s);
+        let t0 = Instant::now();
         let server = if let ClientMessage::Nonce(client_nonce) = client_message {
             server.agree_ssid(client_nonce)
         } else {
@@ -176,6 +182,7 @@ async fn main(_spawner: Spawner) -> ! {
             );
             continue;
         };
+        time_taken += Instant::now().duration_since(t0);
         info!("Received Client Nonce");
 
         // now that we have received the client nonce, send our nonce back
@@ -184,6 +191,7 @@ async fn main(_spawner: Spawner) -> ! {
 
         // ===== Augmentation Layer =====
         client_message = recv!(receiver, s);
+        let t0 = Instant::now();
         #[cfg(not(feature = "strong"))]
         let (server, message) = if let ClientMessage::Username(username) = client_message {
             server.generate_client_info(username, &database, &mut session_rng)
@@ -196,6 +204,7 @@ async fn main(_spawner: Spawner) -> ! {
             );
             continue;
         };
+
         #[cfg(feature = "strong")]
         let (server, message) =
             if let ClientMessage::StrongUsername { username, blinded } = client_message {
@@ -209,63 +218,83 @@ async fn main(_spawner: Spawner) -> ! {
                 );
                 continue;
             };
-        info!("Received Client Username");
+        time_taken += Instant::now().duration_since(t0);
 
         bytes_sent += send!(tx, buf, message);
-        info!("Sent AugmentationInfo");
+        #[cfg(not(feature = "strong"))]
+        {
+            info!("Received Client Username");
+            info!("Sent AugmentationInfo");
+        }
+        #[cfg(feature = "strong")]
+        {
+            info!("Received Client Username and Blinded Point");
+            info!("Sent Strong Augmentation Info");
+        }
 
         // ===== CPace substep =====
+        let t0 = Instant::now();
         let ci = "Server-USART2-Client-SerialPort";
         let (server, message) = server.generate_public_key(ci);
+        time_taken += Instant::now().duration_since(t0);
         bytes_sent += send!(tx, buf, message);
         info!("Sent PublicKey");
 
         client_message = recv!(receiver, s);
-        let server = if let ClientMessage::PublicKey(client_pubkey) = client_message {
-            server.receive_client_pubkey(client_pubkey)
-        } else {
+        let ClientMessage::PublicKey(client_pubkey) = client_message else {
             fmt_log!(
-                ERROR,
-                s,
-                "Received invalid client message {:?}",
-                client_message
-            );
+                    ERROR,
+                    s,
+                    "Received invalid client message {:?}",
+                    client_message
+                );
             continue;
         };
-        info!("Received Client PublicKey");
 
-        // ===== Explicit Mutual Authentication =====
-        client_message = recv!(receiver, s);
-        let (key, message) = if let ClientMessage::Authenticator(ca) = client_message {
-            match server.receive_client_authenticator(ca) {
-                Ok(inner) => inner,
-                Err(e) => {
-                    fmt_log!(
-                        ERROR,
-                        s,
-                        "Client failed the Explicit Mutual Authentication check - {e:?}"
-                    );
-                    continue;
+        let key = if cfg!(feature = "implicit") {
+            server.implicit_auth(client_pubkey)
+        } else {
+            let t0 = Instant::now();
+            let server = server.receive_client_pubkey(client_pubkey);
+            time_taken += Instant::now().duration_since(t0);
+            info!("Received Client PublicKey");
+
+            // ===== Explicit Mutual Authentication =====
+            client_message = recv!(receiver, s);
+            let t0 = Instant::now();
+            let (key, message) = if let ClientMessage::Authenticator(ca) = client_message {
+                match server.receive_client_authenticator(ca) {
+                    Ok(inner) => inner,
+                    Err(e) => {
+                        fmt_log!(
+                            ERROR,
+                            s,
+                            "Client failed the Explicit Mutual Authentication check - {e:?}"
+                        );
+                        continue;
+                    }
                 }
-            }
-        } else {
-            fmt_log!(
-                ERROR,
-                s,
-                "Received invalid client message {:?}",
-                client_message
-            );
-            continue;
-        };
-        bytes_sent += send!(tx, buf, message);
-        info!("Sent Authenticator");
-        info!("Derived final key: {:02X}", key.as_slice());
+            } else {
+                fmt_log!(
+                    ERROR,
+                    s,
+                    "Received invalid client message {:?}",
+                    client_message
+                );
+                continue;
+            };
 
+            time_taken += Instant::now().duration_since(t0);
+            bytes_sent += send!(tx, buf, message);
+
+            info!("Sent Authenticator");
+
+            key
+        };
+
+        info!("Derived final key: {:02X}", key.as_slice());
         info!("Total bytes sent: {}", bytes_sent);
-        info!(
-            "Derived final key in {}ms",
-            Instant::now().duration_since(start).as_millis()
-        );
+        info!("Total computation time: {}ms", time_taken.as_millis());
     }
 }
 

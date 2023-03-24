@@ -30,3 +30,7 @@ features = [
 [features]
 # Feature to use the Strong AuCPace protocol
 strong = ["aucpace/strong_aucpace"]
+# Feature to use the partially augmented version of the protocol
+partial = ["aucpace/partial_augmentation"]
+# Feature to use implicit authnetication
+implicit = []
