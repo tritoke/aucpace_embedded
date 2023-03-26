@@ -223,7 +223,7 @@ fn main() -> Result<()> {
     };
 
     // ===== CPace substep =====
-    let ci = "Server-USART2-Client-SerialPort";
+    let ci = "Server-USART3-Client-SerialPort";
     let (client, message) = client.generate_public_key(ci, &mut rand_core::OsRng);
     bytes_sent += send!(serial, message);
     info!("Sent PublicKey");

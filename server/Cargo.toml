@@ -9,7 +9,7 @@ cortex-m = { version = "0.7", features = ["critical-section-single-core"] }
 cortex-m-rt = "0.7"
 embedded-hal = "0.2"
 
-embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", version = "0.1.0", features = ["nightly", "unstable-traits", "defmt", "stm32f401re", "unstable-pac", "memory-x", "time-driver-any", "exti"]  }
+embassy-stm32 = { git = "https://github.com/embassy-rs/embassy", version = "0.1.0", features = ["nightly", "unstable-traits", "defmt", "stm32h743zi", "unstable-pac", "memory-x", "time-driver-any", "exti"]  }
 embassy-executor = { git = "https://github.com/embassy-rs/embassy", version = "0.1.0", features = ["defmt", "integrated-timers"]  }
 embassy-time = { git = "https://github.com/embassy-rs/embassy", version = "0.1.0", features = ["defmt", "defmt-timestamp-uptime", "unstable-traits"] }
 

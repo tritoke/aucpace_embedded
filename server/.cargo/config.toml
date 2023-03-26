@@ -1,5 +1,5 @@
 [target.'cfg(all(target_arch = "arm", target_os = "none"))']
-runner = "probe-run --chip STM32F401RETx"
+runner = "probe-run --chip STM32H743ZITx"
 
 rustflags = [
     "-C", "link-arg=--nmagic",

@@ -9,7 +9,6 @@ use core::fmt::Write as _;
 use database::SingleUserDatabase;
 use defmt::*;
 use embassy_executor::Spawner;
-use embassy_stm32::time::Hertz;
 use embassy_stm32::usart::{Config, Uart, UartRx};
 use embassy_stm32::{interrupt, peripherals};
 use embassy_time::{Duration, Instant};
@@ -65,7 +64,7 @@ macro_rules! fmt_log {
     };
 }
 
-/// function like macro to wrap sending data over USART2, returns the number of bytes sent
+/// function like macro to wrap sending data over USART3, returns the number of bytes sent
 macro_rules! send {
     ($tx:ident, $buf:ident, $msg:ident) => {{
         let serialised = postcard::to_slice_cobs(&$msg, &mut $buf).unwrap();
@@ -74,7 +73,7 @@ macro_rules! send {
     }};
 }
 
-/// function like macro to wrap receiving data over USART2
+/// function like macro to wrap receiving data over USART3
 macro_rules! recv {
     ($recvr:ident, $s:ident) => {
         loop {
@@ -94,19 +93,15 @@ macro_rules! recv {
 
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) -> ! {
-    let mut rcc_config: embassy_stm32::rcc::Config = Default::default();
-    rcc_config.sys_ck = Some(Hertz::mhz(32));
-    let mut board_config: embassy_stm32::Config = Default::default();
-    board_config.rcc = rcc_config;
-    let p = embassy_stm32::init(board_config);
+    let p = embassy_stm32::init(Default::default());
     info!("Initialised peripherals.");
 
-    // configure USART2 which goes over the USB port on this board
+    // configure USART3 which goes over the USB port on this board
     let config = Config::default();
-    let irq = interrupt::take!(USART2);
+    let irq = interrupt::take!(USART3);
     let (mut tx, rx) =
-        Uart::new(p.USART2, p.PA3, p.PA2, irq, p.DMA1_CH6, p.DMA1_CH5, config).split();
-    info!("Configured USART2.");
+        Uart::new(p.USART3, p.PB11, p.PB10, irq, p.DMA1_CH7, p.DMA1_CH6, config).split();
+    info!("Configured USART3.");
 
     // configure the RNG, kind of insecure but this is just a demo and I don't have real entropy
     let now = Instant::now().as_micros();
@@ -220,7 +215,7 @@ async fn main(_spawner: Spawner) -> ! {
             info!("Received Client Nonce");
 
             // now that we have received the client nonce, send our nonce back
-            bytes_sent = send!(tx, buf, message);
+            bytes_sent += send!(tx, buf, message);
             info!("Sent Nonce");
 
             server
@@ -287,7 +282,7 @@ async fn main(_spawner: Spawner) -> ! {
 
         // ===== CPace substep =====
         let t0 = Instant::now();
-        let ci = "Server-USART2-Client-SerialPort";
+        let ci = "Server-USART3-Client-SerialPort";
         let (server, message) = server.generate_public_key(ci);
         time_taken += Instant::now().duration_since(t0);
         bytes_sent += send!(tx, buf, message);
@@ -354,12 +349,12 @@ async fn main(_spawner: Spawner) -> ! {
 struct MsgReceiver<'uart> {
     buf: [u8; RECV_BUF_LEN],
     idx: usize,
-    rx: UartRx<'uart, peripherals::USART2, peripherals::DMA1_CH5>,
+    rx: UartRx<'uart, peripherals::USART3, peripherals::DMA1_CH6>,
     reset_pos: Option<usize>,
 }
 
 impl<'uart> MsgReceiver<'uart> {
-    fn new(rx: UartRx<'uart, peripherals::USART2, peripherals::DMA1_CH5>) -> Self {
+    fn new(rx: UartRx<'uart, peripherals::USART3, peripherals::DMA1_CH6>) -> Self {
         Self {
             buf: [0u8; 1024],
             idx: 0,
