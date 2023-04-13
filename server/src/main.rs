@@ -95,7 +95,7 @@ macro_rules! recv {
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) -> ! {
     let mut rcc_config: embassy_stm32::rcc::Config = Default::default();
-    rcc_config.sys_ck = Some(Hertz::mhz(48));
+    rcc_config.sys_ck = Some(Hertz::mhz(84));
     let mut board_config: embassy_stm32::Config = Default::default();
     board_config.rcc = rcc_config;
     let p = embassy_stm32::init(board_config);
