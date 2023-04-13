@@ -95,14 +95,15 @@ macro_rules! recv {
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) -> ! {
     let mut rcc_config: embassy_stm32::rcc::Config = Default::default();
-    rcc_config.sys_ck = Some(Hertz::mhz(32));
+    rcc_config.sys_ck = Some(Hertz::mhz(48));
     let mut board_config: embassy_stm32::Config = Default::default();
     board_config.rcc = rcc_config;
     let p = embassy_stm32::init(board_config);
     info!("Initialised peripherals.");
 
     // configure USART2 which goes over the USB port on this board
-    let config = Config::default();
+    let mut config = Config::default();
+    config.baudrate = 28800;
     let irq = interrupt::take!(USART2);
     let (mut tx, rx) =
         Uart::new(p.USART2, p.PA3, p.PA2, irq, p.DMA1_CH6, p.DMA1_CH5, config).split();
@@ -220,7 +221,7 @@ async fn main(_spawner: Spawner) -> ! {
             info!("Received Client Nonce");
 
             // now that we have received the client nonce, send our nonce back
-            bytes_sent = send!(tx, buf, message);
+            bytes_sent += send!(tx, buf, message);
             info!("Sent Nonce");
 
             server
@@ -261,7 +262,18 @@ async fn main(_spawner: Spawner) -> ! {
                 &database,
                 &mut session_rng,
             );
-            ret
+            match ret {
+                Ok(inner) => inner,
+                Err(e) => {
+                    fmt_log!(
+                        ERROR,
+                        s,
+                        "Receiving client Public Key returned an error {:?}",
+                        e
+                    );
+                    continue;
+                }
+            }
         } else {
             fmt_log!(
                 ERROR,
@@ -305,10 +317,32 @@ async fn main(_spawner: Spawner) -> ! {
         };
 
         let key = if cfg!(feature = "implicit") {
-            server.implicit_auth(client_pubkey)
+            match server.implicit_auth(client_pubkey) {
+                Ok(s) => s,
+                Err(e) => {
+                    fmt_log!(
+                        ERROR,
+                        s,
+                        "Receiving client Public Key returned an error {:?}",
+                        e
+                    );
+                    continue;
+                }
+            }
         } else {
             let t0 = Instant::now();
-            let server = server.receive_client_pubkey(client_pubkey);
+            let server = match server.receive_client_pubkey(client_pubkey) {
+                Ok(s) => s,
+                Err(e) => {
+                    fmt_log!(
+                        ERROR,
+                        s,
+                        "Receiving client Public Key returned an error {:?}",
+                        e
+                    );
+                    continue;
+                }
+            };
             time_taken += Instant::now().duration_since(t0);
             info!("Received Client PublicKey");
 
@@ -377,7 +411,14 @@ impl<'uart> MsgReceiver<'uart> {
             self.reset_pos = None;
         }
 
-        loop {
+        // if there is a zero in the message buffer try to process that msg
+        let previous_msg_zi = self.buf[..self.idx].iter().position(|x| *x == 0);
+
+        let zi = loop {
+            if let Some(zi) = previous_msg_zi {
+                break zi;
+            }
+
             // read as much as we can off the wire
             let count = unwrap!(self.rx.read_until_idle(&mut self.buf[self.idx..]).await);
             let zero_idx = if count == 0 {
@@ -409,19 +450,22 @@ impl<'uart> MsgReceiver<'uart> {
 
                 continue;
             };
-            trace!("self.buf[..self.idx] = {:02X}", self.buf[..self.idx]);
-            trace!(
-                "Found zero byte at index {} - {} - {}",
-                zi,
-                self.buf[zi],
-                self.idx
-            );
 
-            // store zi for next time
-            self.reset_pos = Some(zi);
+            break zi;
+        };
 
-            // parse the result
-            break postcard::from_bytes_cobs::<ClientMessage<K1>>(&mut self.buf[..=zi]);
-        }
+        trace!("self.buf[..self.idx] = {:02X}", self.buf[..self.idx]);
+        trace!(
+            "Found zero byte at index {} - {} - {}",
+            zi,
+            self.buf[zi],
+            self.idx
+        );
+
+        // store zi for next time
+        self.reset_pos = Some(zi);
+
+        // parse the result
+        postcard::from_bytes_cobs::<ClientMessage<K1>>(&mut self.buf[..=zi])
     }
 }

@@ -19,7 +19,7 @@ scrypt = "0.11"
 
 [dependencies.aucpace]
 git = "https://github.com/RustCrypto/PAKEs"
-rev = "0c7e57a"
+rev = "237b48d"
 features = [
     "zeroize",
     "getrandom",

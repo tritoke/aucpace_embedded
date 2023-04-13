@@ -12,7 +12,7 @@ use std::{io, thread};
 #[allow(unused)]
 use tracing::{debug, error, info, trace, warn};
 
-const USART_BAUD: u32 = 115200;
+const USART_BAUD: u32 = 28800;
 const RECV_BUF_LEN: usize = 1024;
 const K1: usize = 16;
 
@@ -26,15 +26,13 @@ const SSID: [u8; 32] = [
 macro_rules! send {
     ($serial_mtx:ident, $msg:ident) => {{
         let serialised = postcard::to_stdvec_cobs(&$msg).expect("Failed to serialise message");
-        for chunk in serialised.chunks(16) {
-            trace!("Sending {} byte long message - {chunk:02X?}", chunk.len());
-            $serial_mtx
-                .lock()
-                .expect("Failed to acquire serial port mutex")
-                .write_all(&chunk)
-                .expect("Failed to write message to serial");
-            thread::sleep(Duration::from_millis(100));
-        }
+        trace!("Sending {} byte long message - {serialised:02X?}", serialised.len());
+        $serial_mtx
+            .lock()
+            .expect("Failed to acquire serial port mutex")
+            .write_all(&serialised)
+            .expect("Failed to write message to serial");
+        thread::sleep(Duration::from_millis(10));
         serialised.len()
     }};
 }
@@ -234,8 +232,10 @@ fn main() -> Result<()> {
     };
     let key = if cfg!(feature = "implicit") {
         client.implicit_auth(server_pubkey)
+            .map_err(|e| anyhow!(e))?
     } else {
-        let (client, message) = client.receive_server_pubkey(server_pubkey);
+        let (client, message) = client.receive_server_pubkey(server_pubkey)
+            .map_err(|e| anyhow!(e))?;
 
         // ===== Explicit Mutual Auth =====
         bytes_sent += send!(serial, message);
