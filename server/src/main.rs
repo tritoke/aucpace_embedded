@@ -381,7 +381,7 @@ async fn main(_spawner: Spawner) -> ! {
 
         info!("Derived final key: {:02X}", key.as_slice());
         info!("Total bytes sent: {}", bytes_sent);
-        info!("Total computation time: {}ms", time_taken.as_millis());
+        info!("Total computation time: {}ms - {} ticks", time_taken.as_millis(), time_taken.as_ticks());
     }
 }
 
