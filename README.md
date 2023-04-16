@@ -7,3 +7,6 @@ Effect of feature flags and compilation mode on Compute Time (ms) and Code Size 
 
 ![](assets/feature_effects.png)
 
+## Example run
+![](assets/example_run.png)
+
