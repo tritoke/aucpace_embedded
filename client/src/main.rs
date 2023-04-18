@@ -136,7 +136,6 @@ fn main() -> Result<()> {
             .register_alloc_strong(user.as_bytes(), pass, Params::recommended(), Scrypt)
             .map_err(|e| anyhow!(e))?;
 
-        bytes_sent += send!(serial, message);
         info!(
             "Registered as {user}:{pass} for {}",
             if cfg!(feature = "strong") {
